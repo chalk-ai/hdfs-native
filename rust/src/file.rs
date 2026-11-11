@@ -283,33 +283,16 @@ impl FileWriter {
                 None
             };
 
-            let mut retry_delay = COMPLETE_RETRY_DELAY_MS;
-            let mut retries = 0;
-            while retries < COMPLETE_RETRIES {
-                let successful = self
+            complete_file(&self.handle, || async {
+                Ok(self
                     .protocol
                     .complete(&self.src, extended_block.clone(), self.status.file_id)
                     .await?
-                    .result;
-
-                if successful {
-                    self.closed = true;
-                    return Ok(());
-                }
-
-                // Sleep in the provided runtime in case we are not called from a tokio runtime
-                let sleep = {
-                    let _guard = self.handle.enter();
-                    tokio::time::sleep(Duration::from_millis(retry_delay))
-                };
-                sleep.await;
-
-                retry_delay *= 2;
-                retries += 1;
-            }
-            Err(HdfsError::OperationFailed(
-                "Failed to complete file in time".to_string(),
-            ))
+                    .result)
+            })
+            .await?;
+            self.closed = true;
+            Ok(())
         } else {
             Ok(())
         }
@@ -326,5 +309,131 @@ impl Drop for FileWriter {
 
         self.protocol
             .remove_file_lease(self.status.file_id(), self.status.namespace.clone());
+    }
+}
+
+async fn complete_file<F, Fut>(handle: &Handle, mut complete: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    let mut retry_delay = COMPLETE_RETRY_DELAY_MS;
+    let mut retries = 0;
+    let mut immediate_retry = true;
+    while retries < COMPLETE_RETRIES {
+        if complete().await? {
+            return Ok(());
+        }
+
+        // The final DataNode acknowledgement can precede the NameNode's block
+        // report processing. Retry once before sleeping, then retain bounded backoff.
+        if immediate_retry {
+            immediate_retry = false;
+            continue;
+        }
+
+        // Sleep in the provided runtime in case we are not called from a tokio runtime.
+        let sleep = {
+            let _guard = handle.enter();
+            tokio::time::sleep(Duration::from_millis(retry_delay))
+        };
+        sleep.await;
+
+        retry_delay *= 2;
+        retries += 1;
+    }
+    Err(HdfsError::OperationFailed(
+        "Failed to complete file in time".to_string(),
+    ))
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::task::Poll;
+
+    #[tokio::test(start_paused = true)]
+    async fn first_completion_success_does_not_retry() {
+        let attempts = Cell::new(0);
+        let handle = Handle::current();
+        let complete = complete_file(&handle, || {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Ok(true))
+        });
+        tokio::pin!(complete);
+        assert!(matches!(futures::poll!(complete), Poll::Ready(Ok(()))));
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_retries_once_without_waiting() {
+        let attempts = Cell::new(0);
+        let handle = Handle::current();
+        let complete = complete_file(&handle, || {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Ok(attempts.get() == 2))
+        });
+        tokio::pin!(complete);
+        assert!(matches!(futures::poll!(complete), Poll::Ready(Ok(()))));
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsuccessful_immediate_retry_waits_before_next_attempt() {
+        let attempts = Cell::new(0);
+        let handle = Handle::current();
+        let complete = complete_file(&handle, || {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Ok(false))
+        });
+        tokio::pin!(complete);
+        assert!(futures::poll!(complete.as_mut()).is_pending());
+        assert_eq!(attempts.get(), 2);
+        assert!(futures::poll!(complete.as_mut()).is_pending());
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_succeeds_after_backoff() {
+        let attempts = Cell::new(0);
+        let start = tokio::time::Instant::now();
+        complete_file(&Handle::current(), || {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Ok(attempts.get() == 3))
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(start.elapsed(), Duration::from_millis(500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_exhaustion_preserves_the_backoff_budget() {
+        let attempts = Cell::new(0);
+        let start = tokio::time::Instant::now();
+        let result = complete_file(&Handle::current(), || {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Ok(false))
+        })
+        .await;
+        assert!(matches!(result, Err(HdfsError::OperationFailed(_))));
+        assert_eq!(attempts.get(), 6);
+        assert_eq!(start.elapsed(), Duration::from_millis(15_500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_rpc_errors_are_returned_without_retry() {
+        let attempts = Cell::new(0);
+        let handle = Handle::current();
+        let complete = complete_file(&handle, || {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Err(HdfsError::OperationFailed(
+                "completion RPC failed".into(),
+            )))
+        });
+        tokio::pin!(complete);
+        assert!(matches!(futures::poll!(complete), Poll::Ready(Err(_))));
+        assert_eq!(attempts.get(), 1);
     }
 }
