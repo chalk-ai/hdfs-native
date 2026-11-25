@@ -565,7 +565,11 @@ impl SaslSession for DigestSaslSession {
     }
 
     fn get_user_info(&self) -> crate::Result<super::user::UserInfo> {
-        // The token has all the info
+        if !matches!(self.state, DigestState::Completed(_)) {
+            return Err(HdfsError::SASLError(
+                "DIGEST-MD5 authentication is not complete".to_string(),
+            ));
+        }
         Ok(UserInfo {
             real_user: None,
             effective_user: None,
@@ -580,7 +584,31 @@ mod test {
         user::Token,
     };
 
-    use super::DigestSaslSession;
+    use super::{DigestSaslSession, DigestState};
+    use crate::security::sasl::SaslSession;
+
+    #[test]
+    fn user_info_requires_completed_authentication() {
+        let mut session = DigestSaslSession {
+            auth_id: "test".to_string(),
+            password: "fake-secret".to_string(),
+            service: "hdfs".to_string(),
+            hostname: "test".to_string(),
+            state: DigestState::Pending,
+        };
+        assert!(session.get_user_info().is_err());
+        session.state = DigestState::Stepped(DigestContext {
+            nonce: "server-nonce".to_string(),
+            cnonce: "client-nonce".to_string(),
+            realm: "default".to_string(),
+            qop: Qop::Auth,
+        });
+        assert!(session.get_user_info().is_err());
+        session.state = DigestState::Completed(None);
+        assert!(session.get_user_info().is_ok());
+        session.state = DigestState::Errored;
+        assert!(session.get_user_info().is_err());
+    }
 
     #[test]
     fn test_challenge_parse() {
