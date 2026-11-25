@@ -93,24 +93,20 @@ pub(crate) async fn negotiate_sasl_session(
         let mut response: Option<RpcSaslProto> = None;
         let message = reader.read_response().await?;
         debug!("Handling SASL message: {:?}", message);
-        match SaslState::try_from(message.state).unwrap() {
+        match SaslState::try_from(message.state)
+            .map_err(|_| HdfsError::SASLError("Invalid SASL negotiation state".to_string()))?
+        {
             SaslState::Negotiate => {
-                let (mut selected_auth, selected_session) = select_method(&message.auths, service)?;
-                session = selected_session;
-
-                let token = if let Some(session) = session.as_mut() {
-                    let (token, finished) =
-                        session.step(selected_auth.challenge.as_ref().map(|c| &c[..]))?;
-                    if finished {
-                        return Err(HdfsError::SASLError(
-                            "SASL negotiation finished too soon".to_string(),
-                        ));
-                    }
-                    Some(token)
-                } else {
-                    done = true;
-                    None
-                };
+                let (mut selected_auth, mut selected_session) =
+                    select_method(&message.auths, service)?;
+                let (token, finished) =
+                    selected_session.step(selected_auth.challenge.as_deref())?;
+                if finished {
+                    return Err(HdfsError::SASLError(
+                        "SASL negotiation finished too soon".to_string(),
+                    ));
+                }
+                session = Some(selected_session);
 
                 // Response shouldn't contain the challenge
                 selected_auth.challenge = None;
@@ -118,7 +114,7 @@ pub(crate) async fn negotiate_sasl_session(
                 let r = RpcSaslProto {
                     state: SaslState::Initiate as i32,
                     auths: Vec::from([selected_auth]),
-                    token: token.or(Some(Vec::new())),
+                    token: Some(token),
                     ..Default::default()
                 };
                 response = Some(r);
@@ -126,7 +122,11 @@ pub(crate) async fn negotiate_sasl_session(
             SaslState::Challenge => {
                 let (token, _) = session
                     .as_mut()
-                    .unwrap()
+                    .ok_or_else(|| {
+                        HdfsError::SASLError(
+                            "SASL challenge before mechanism selection".to_string(),
+                        )
+                    })?
                     .step(message.token.as_ref().map(|t| &t[..]))?;
 
                 let r = RpcSaslProto {
@@ -138,7 +138,14 @@ pub(crate) async fn negotiate_sasl_session(
             }
             SaslState::Success => {
                 if let Some(token) = message.token.as_ref() {
-                    let (_, finished) = session.as_mut().unwrap().step(Some(&token[..]))?;
+                    let (_, finished) = session
+                        .as_mut()
+                        .ok_or_else(|| {
+                            HdfsError::SASLError(
+                                "SASL success before mechanism selection".to_string(),
+                            )
+                        })?
+                        .step(Some(&token[..]))?;
                     if !finished {
                         return Err(HdfsError::SASLError(
                             "Client not finished after server success".to_string(),
@@ -147,7 +154,11 @@ pub(crate) async fn negotiate_sasl_session(
                 }
                 done = true;
             }
-            _ => todo!(),
+            _ => {
+                return Err(HdfsError::SASLError(
+                    "Unexpected SASL negotiation state".to_string(),
+                ));
+            }
         }
 
         if let Some(r) = response {
@@ -156,17 +167,15 @@ pub(crate) async fn negotiate_sasl_session(
         }
     }
 
-    let user_info = if let Some(s) = session.as_ref() {
-        s.get_user_info()?
-    } else {
-        User::get_simple_user()
-    };
+    // A server success cannot replace completed client authentication. Each
+    // mechanism exposes user information only after validating its final token.
+    let session = session.ok_or_else(|| {
+        HdfsError::SASLError("SASL success before mechanism selection".to_string())
+    })?;
+    let user_info = session.get_user_info()?;
     let session = session
-        .filter(|x| {
-            debug!("Has security layer: {:?}", x.has_security_layer());
-            x.has_security_layer()
-        })
-        .map(|s| Arc::new(Mutex::new(s)));
+        .has_security_layer()
+        .then(|| Arc::new(Mutex::new(session)));
 
     if let Some(session) = session {
         reader.set_session(Arc::clone(&session));
@@ -175,22 +184,18 @@ pub(crate) async fn negotiate_sasl_session(
     Ok((user_info, reader, writer))
 }
 
-fn select_method(
-    auths: &[SaslAuth],
-    service: &str,
-) -> Result<(SaslAuth, Option<Box<dyn SaslSession>>)> {
+fn select_method(auths: &[SaslAuth], service: &str) -> Result<(SaslAuth, Box<dyn SaslSession>)> {
+    // Explicit simple mode bypasses SASL. Secure connections must select an
+    // authenticated mechanism even when the peer offers SIMPLE first.
     let user = User::get();
     for auth in auths.iter() {
         match (
             AuthMethod::parse(&auth.method),
             user.get_token(HDFS_DELEGATION_TOKEN, service),
         ) {
-            (Some(AuthMethod::Simple), _) => {
-                return Ok((auth.clone(), None));
-            }
             (Some(AuthMethod::Kerberos), _) => {
                 let session = GssapiSession::new(auth.protocol(), auth.server_id())?;
-                return Ok((auth.clone(), Some(Box::new(session))));
+                return Ok((auth.clone(), Box::new(session)));
             }
             (Some(AuthMethod::Token), Some(token)) => {
                 let session = DigestSaslSession::from_token(
@@ -199,7 +204,7 @@ fn select_method(
                     token,
                 );
 
-                return Ok((auth.clone(), Some(Box::new(session))));
+                return Ok((auth.clone(), Box::new(session)));
             }
             _ => (),
         }
@@ -751,5 +756,108 @@ impl SaslDatanodeConnection {
             256 => Box::new(Aes256Ctr::new(key.into(), iv.into())),
             x => panic!("Unsupported AES bit length {x}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    async fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        (client.unwrap(), server.unwrap().0)
+    }
+
+    fn config(directory: &std::path::Path, authentication: &str) -> Configuration {
+        Configuration::new(
+            Some(directory.to_str().unwrap().to_string()),
+            Some(HashMap::from([(
+                "hadoop.security.authentication".to_string(),
+                authentication.to_string(),
+            )])),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn secure_connections_reject_simple_and_unselected_mechanisms() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(directory.path(), "kerberos");
+        let replies = [
+            RpcSaslProto {
+                state: SaslState::Negotiate as i32,
+                auths: vec![SaslAuth {
+                    method: "SIMPLE".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            RpcSaslProto {
+                state: SaslState::Success as i32,
+                ..Default::default()
+            },
+            RpcSaslProto {
+                state: SaslState::Success as i32,
+                token: Some(Vec::new()),
+                ..Default::default()
+            },
+            RpcSaslProto {
+                state: SaslState::Challenge as i32,
+                ..Default::default()
+            },
+            RpcSaslProto {
+                state: i32::MAX,
+                ..Default::default()
+            },
+        ];
+        for reply in &replies {
+            let (client, mut server) = socket_pair().await;
+            let header = RpcResponseHeaderProto {
+                call_id: SASL_CALL_ID as u32,
+                status: RpcStatusProto::Success as i32,
+                ..Default::default()
+            };
+            let payload = [
+                header.encode_length_delimited_to_vec(),
+                reply.encode_length_delimited_to_vec(),
+            ]
+            .concat();
+            server.write_u32(payload.len() as u32).await.unwrap();
+            server.write_all(&payload).await.unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                negotiate_sasl_session(client, "test", &config),
+            )
+            .await
+            .expect("invalid authentication response must finish promptly");
+            assert!(matches!(
+                result,
+                Err(HdfsError::NoSASLMechanism | HdfsError::SASLError(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicitly_configured_simple_connections_skip_sasl() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(directory.path(), "simple");
+        let (client, mut server) = socket_pair().await;
+        let (_, reader, writer) = negotiate_sasl_session(client, "test", &config)
+            .await
+            .unwrap();
+        assert!(reader.session.is_none());
+        assert!(writer.session.is_none());
+        server.write_all(b"application data").await.unwrap();
+        let mut reader = reader;
+        let mut data = [0; 16];
+        reader.read_exact(&mut data).await.unwrap();
+        assert_eq!(&data, b"application data");
     }
 }
